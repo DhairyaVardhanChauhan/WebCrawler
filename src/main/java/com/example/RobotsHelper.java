@@ -8,6 +8,9 @@ import redis.clients.jedis.JedisCluster;
 import java.awt.print.Pageable;
 import java.io.IOException;
 import java.net.URI;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
 
 import static com.example.Crawler.getJedis;
 
@@ -29,33 +32,82 @@ public class RobotsHelper{
         }
     }
 
-    public static RobotsRules parseRobots(String content){
-        RobotsRules rules = new RobotsRules();
-        boolean applies = false;
-        if(content == null){
-            return rules;
-        }
-        for(String line: content.split("\n")){
-            if(line.startsWith("user-agent")){
-                applies = line.contains("*");
+    public static List<RobotsGroup> parseRobotsGroups(String content) {
+        List<RobotsGroup> groups = new ArrayList<>();
+        RobotsGroup current = null;
+
+        if (content == null) return groups;
+
+        for (String rawLine : content.split("\n")) {
+            String line = rawLine.split("#", 2)[0].trim();
+            if (line.isEmpty()) continue;
+            String lower = line.toLowerCase(Locale.ROOT);
+            if (lower.startsWith("user-agent:")) {
+                String agent = line.split(":", 2)[1].trim().toLowerCase();
+                if (current == null || !current.userAgents.isEmpty() && (!current.allow.isEmpty() || !current.disallow.isEmpty())) {
+                    current = new RobotsGroup();
+                    groups.add(current);
+                }
+                current.userAgents.add(agent);
             }
-            else if(applies && line.startsWith("disallow:")){
+            else if (current != null && lower.startsWith("disallow:")) {
                 String path = line.split(":", 2)[1].trim();
-                if (!path.isEmpty()) rules.getDisallowed().add(path);
+                current.disallow.add(path);
             }
-            else if(applies && line.startsWith("allow:")){
-                String path = line.split(":",2)[1].trim();
-                if(!path.isEmpty()) rules.getAllowed().add(path);
-            }else if (applies && line.startsWith("crawl-delay:")) {
+            else if (current != null && lower.startsWith("allow:")) {
+                String path = line.split(":", 2)[1].trim();
+                current.allow.add(path);
+            }
+            else if (current != null && lower.startsWith("crawl-delay:")) {
                 try {
-                    int seconds = Integer.parseInt(line.split(":", 2)[1].trim());
-                    rules.crawlDelayMs = seconds * 1000;
-                } catch (Exception ignored) {
+                    current.crawlDelaySeconds =
+                            Integer.parseInt(line.split(":", 2)[1].trim());
+                } catch (Exception ignored) {}
+            }
+        }
+        return groups;
+    }
+
+    public static RobotsRules resolveRules(
+            List<RobotsGroup> groups,
+            String myAgent
+    ) {
+        myAgent = myAgent.toLowerCase(Locale.ROOT);
+
+        RobotsGroup best = null;
+        int bestLen = -1;
+
+        for (RobotsGroup group : groups) {
+            for (String agent : group.userAgents) {
+                if (agent.equals("*") || myAgent.contains(agent)) {
+                    if (agent.length() > bestLen) {
+                        bestLen = agent.length();
+                        best = group;
+                    }
                 }
             }
         }
+
+        RobotsRules rules = new RobotsRules();
+        if (best == null) return rules;
+
+        rules.getAllowed().addAll(best.allow);
+        rules.getDisallowed().addAll(best.disallow);
+
+        if (best.crawlDelaySeconds != null) {
+            rules.crawlDelayMs = best.crawlDelaySeconds * 1000;
+        }
+
         return rules;
     }
+
+
+
+    public static RobotsRules parseRobots(String content, String myAgent) {
+        List<RobotsGroup> groups = parseRobotsGroups(content);
+        return resolveRules(groups, myAgent);
+    }
+
 
     public static RobotsRules getRobotsRules(String domain) {
         String key = "robots:" + domain;
@@ -66,7 +118,7 @@ public class RobotsHelper{
             }
         }
         String robotsContent = fetchRobotsTxt(domain);
-        RobotsRules parseRobotsRule = parseRobots(robotsContent);
+        RobotsRules parseRobotsRule = parseRobots(robotsContent,"*");
 
         try (Jedis jedis = getJedis()) {
             jedis.setex(
