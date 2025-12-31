@@ -18,17 +18,15 @@ import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.sql.SQLOutput;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import com.google.common.hash.Hashing;
 
 public class Crawler {
 
+    static JedisPool jedisPool = new JedisPool(System.getenv().getOrDefault("REDIS_HOST", "localhost"), 6379);
 
-    static BloomFilter<String> bloomFilter =
-            BloomFilter.create
-                    (Funnels.stringFunnel(StandardCharsets.UTF_8), 10_000_000);
-
-    static JedisPool jedisPool = new JedisPool("localhost", 6379);
 
     public static Jedis getJedis() {
         return jedisPool.getResource();
@@ -81,7 +79,7 @@ public class Crawler {
         ).toString();
     }
 
-    private static boolean isEncodingBomb(String url){
+    private static boolean isEncodingBomb(String url) {
         int count = 0;
         for (int i = 0; i < url.length() - 2; i++) {
             if (url.charAt(i) == '%' &&
@@ -201,6 +199,111 @@ public class Crawler {
         return false;
     }
 
+    public static void crawl() throws IOException, URISyntaxException {
+        String rawUrl;
+        try (Jedis jedis = getJedis()) {
+            List<String> data = jedis.blpop(5, "queue", "queue:retry");
+            if (data == null) return;
+            rawUrl = data.get(1);
+            jedis.lpush("queue:processing", rawUrl);
+        }
+
+        String url;
+        try {
+            url = normalizeUrl(rawUrl);
+        } catch (Exception e) {
+            try (Jedis jedis = getJedis()) {
+                jedis.lrem("queue:processing", 1, rawUrl);
+            }
+            return;
+        }
+        System.out.println("Thread: " + Thread.currentThread().getName() + " fetched url -> " + url);
+        if (!isValidData(url)) {
+            try (Jedis jedis = getJedis()) {
+                jedis.lrem("queue:processing", 1, rawUrl);
+            }
+            return;
+        }
+
+        String domain;
+        try {
+            domain = getDomain(url);
+        } catch (Exception e) {
+            try (Jedis jedis = getJedis()) {
+                jedis.lrem("queue:processing", 1, rawUrl);
+            }
+            return;
+        }
+        String activeKey = "domain:active:" + domain;
+        try (Jedis jedis = getJedis()) {
+            long active = jedis.incr(activeKey);
+            if (active > 3) {
+                jedis.decr(activeKey);
+                jedis.rpush("queue", url);
+                jedis.lrem("queue:processing", 1, rawUrl);
+                return;
+            }
+            RobotsRules robotsRules = RobotsHelper.getRobotsRules(domain);
+            if (!RobotsHelper.isAllowedByRobots(url, robotsRules)) {
+                System.out.println("Blocked by robots.txt: " + url);
+                jedis.decr(activeKey);
+                jedis.lrem("queue:processing", 1, rawUrl);
+                return;
+            }
+
+            if (!acquireDomainLock(domain, robotsRules.crawlDelayMs)) {
+                jedis.decr(activeKey);
+                jedis.lrem("queue:processing", 1, rawUrl);
+                jedis.rpush("queue", url);
+                return;
+            }
+
+            if (jedis.sismember("visitedUrls", url)) {
+                jedis.decr(activeKey);
+                jedis.lrem("queue:processing", 1, rawUrl);
+                return;
+            }
+
+            if (jedis.sadd("visitedUrls", url) == 0) {
+                jedis.decr(activeKey);
+                jedis.lrem("queue:processing", 1, rawUrl);
+                return;
+            }
+
+            Document doc;
+            try {
+                doc = retrieveHTML(url);
+            } catch (Exception e) {
+                long retries = jedis.hincrBy("url:retries", url, 1);
+                jedis.decr(activeKey);
+                jedis.lrem("queue:processing", 1, rawUrl);
+                jedis.rpush(retries <= 3 ? "queue:retry" : "queue:dead", url);
+                return;
+            }
+
+            if (isDuplicateContent(doc.html())) {
+                jedis.decr(activeKey);
+                jedis.lrem("queue:processing", 1, rawUrl);
+                jedis.hdel("url:retries", url);
+                return;
+            }
+
+            extractProductData(doc);
+            for (Element link : doc.select("a[href]")) {
+                try {
+                    String next = normalizeUrl(link.absUrl("href"));
+                    if (isValidData(next) && jedis.sadd("seenUrls", next) == 1) {
+                        jedis.rpush("queue", next);
+                    }
+                } catch (Exception ignored) {
+                }
+            }
+            jedis.hdel("url:retries", url);
+            jedis.decr(activeKey);
+            jedis.lrem("queue:processing", 1, rawUrl);
+        }
+    }
+
     public static void main(String[] args) throws IOException, InterruptedException, URISyntaxException {
         String seedUrl = "https://www.scrapingcourse.com/ecommerce";
         Document document = retrieveHTML(seedUrl);
@@ -210,114 +313,19 @@ public class Crawler {
         try (Jedis jedis = getJedis()) {
             jedis.lpush("queue", seedUrl);
         }
+
         System.out.println("Normalized " + normalizeUrl(seedUrl));
-
-        while (true) {
-
-            String rawUrl;
-            try (Jedis jedis = getJedis()) {
-                List<String> data = jedis.blpop(5, "queue", "queue:retry");
-                if (data == null) continue;
-                rawUrl = data.get(1);
-                jedis.lpush("queue:processing", rawUrl);
-            }
-
-            String url;
-            try {
-                url = normalizeUrl(rawUrl);
-            } catch (Exception e) {
-                try (Jedis jedis = getJedis()) {
-                    jedis.lrem("queue:processing", 1, rawUrl);
-                }
-                continue;
-            }
-            System.out.println("Url fetched is: " + url);
-            if (!isValidData(url)) {
-                try (Jedis jedis = getJedis()) {
-                    jedis.lrem("queue:processing", 1, rawUrl);
-                }
-                continue;
-            }
-
-            String domain;
-            try {
-                domain = getDomain(url);
-            } catch (Exception e) {
-                try (Jedis jedis = getJedis()) {
-                    jedis.lrem("queue:processing", 1, rawUrl);
-                }
-                continue;
-            }
-            String activeKey = "domain:active:" + domain;
-            try (Jedis jedis = getJedis()){
-                long active = jedis.incr(activeKey);
-                if (active > 3) {
-                    jedis.decr(activeKey);
-                    jedis.rpush("queue", url);
-                    jedis.lrem("queue:processing", 1, rawUrl);
-                    continue;
-                }
-                RobotsRules robotsRules = RobotsHelper.getRobotsRules(domain);
-                if (!RobotsHelper.isAllowedByRobots(url, robotsRules)) {
-                    System.out.println("Blocked by robots.txt: " + url);
-                    jedis.decr(activeKey);
-                    jedis.lrem("queue:processing", 1, rawUrl);
-                    continue;
-                }
-
-                if (!acquireDomainLock(domain, robotsRules.crawlDelayMs)) {
-                    jedis.decr(activeKey);
-                    jedis.lrem("queue:processing", 1, rawUrl);
-                    jedis.rpush("queue", url);
-                    continue;
-                }
-
-                if (bloomFilter.mightContain(url) && jedis.sismember("visitedUrls", url)) {
-                    jedis.decr(activeKey);
-                    jedis.lrem("queue:processing", 1, rawUrl);
-                    continue;
-                }
-
-                if (jedis.sadd("visitedUrls", url) == 0) {
-                    jedis.decr(activeKey);
-                    jedis.lrem("queue:processing", 1, rawUrl);
-                    continue;
-                }
-
-                bloomFilter.put(url);
-                Document doc;
-                try {
-                    doc = retrieveHTML(url);
-                } catch (Exception e) {
-                    long retries = jedis.hincrBy("url:retries", url, 1);
-                    jedis.decr(activeKey);
-                    jedis.lrem("queue:processing", 1, rawUrl);
-                    jedis.rpush(retries <= 3 ? "queue:retry" : "queue:dead", url);
-                    continue;
-                }
-
-                if (isDuplicateContent(doc.html())) {
-                    jedis.decr(activeKey);
-                    jedis.lrem("queue:processing", 1, rawUrl);
-                    jedis.hdel("url:retries", url);
-                    continue;
-                }
-
-                extractProductData(doc);
-                for (Element link : doc.select("a[href]")) {
+        ExecutorService executorService = Executors.newFixedThreadPool(5);
+        for (int i = 0; i < 5; i++) {
+            executorService.execute(() -> {
+                while (true) {
                     try {
-                        String next = normalizeUrl(link.absUrl("href"));
-                        if (isValidData(next) && jedis.sadd("seenUrls", next) == 1) {
-                            jedis.rpush("queue", next);
-                        }
-                    } catch (Exception ignored) {
+                        crawl();
+                    } catch (Exception e) {
+                        e.printStackTrace();
                     }
                 }
-                jedis.hdel("url:retries", url);
-                jedis.decr(activeKey);
-                jedis.lrem("queue:processing", 1, rawUrl);
-            }
+            });
         }
     }
-
 }

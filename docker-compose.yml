@@ -1,0 +1,22 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis/redis-stack:latest
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+
+  crawler:
+    build: .
+    depends_on:
+      - redis
+    environment:
+      REDIS_HOST: redis
+    deploy:
+      replicas: 3
+    restart: unless-stopped
+
+volumes:
+  redis-data:
