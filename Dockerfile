@@ -9,12 +9,10 @@ RUN mvn -B -q dependency:go-offline
 COPY src ./src
 RUN mvn clean package -DskipTests
 
-# ---------- Runtime stage ----------
 FROM eclipse-temurin:17-jre
 
 WORKDIR /app
 
-# COPY EXACT shaded JAR (no wildcard)
 COPY --from=builder /app/target/WebCrawler-1.0-SNAPSHOT.jar app.jar
 
 ENV JAVA_OPTS="-Xms512m -Xmx512m -XX:+UseG1GC"
