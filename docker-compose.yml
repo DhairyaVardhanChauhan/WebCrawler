@@ -3,19 +3,47 @@ version: "3.9"
 services:
   redis:
     image: redis/redis-stack:latest
+    container_name: webcrawler-redis
     ports:
       - "6379:6379"
     volumes:
       - redis-data:/data
+    restart: unless-stopped
 
-  crawler:
+  crawler-1:
     build: .
+    container_name: webcrawler-crawler-1
     depends_on:
       - redis
     environment:
       REDIS_HOST: redis
-    deploy:
-      replicas: 3
+      SERVER_PORT: 9090
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  crawler-2:
+    build: .
+    container_name: webcrawler-crawler-2
+    depends_on:
+      - redis
+    environment:
+      REDIS_HOST: redis
+      SERVER_PORT: 9091
+    ports:
+      - "9091:9091"
+    restart: unless-stopped
+
+  crawler-3:
+    build: .
+    container_name: webcrawler-crawler-3
+    depends_on:
+      - redis
+    environment:
+      REDIS_HOST: redis
+      SERVER_PORT: 9092
+    ports:
+      - "9092:9092"
     restart: unless-stopped
 
 volumes:

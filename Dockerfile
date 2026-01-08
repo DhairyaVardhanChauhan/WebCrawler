@@ -13,7 +13,7 @@ FROM eclipse-temurin:17-jre
 
 WORKDIR /app
 
-COPY --from=builder /app/target/WebCrawler-1.0-SNAPSHOT.jar app.jar
+COPY --from=builder /app/target/crawler-service-1.0.0.jar app.jar
 
 ENV JAVA_OPTS="-Xms512m -Xmx512m -XX:+UseG1GC"
 
